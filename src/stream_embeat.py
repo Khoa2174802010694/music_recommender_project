@@ -58,7 +58,7 @@ def stream_from_local_sample(
     sample_csv_path: str = DEFAULT_LOCAL_SAMPLE,
     callback_fn: Optional[Callable[[pd.DataFrame], None]] = None,
     batch_size: int = 1000,
-    min_popularity: int = 0,
+    min_popularity: float = 0.0,
 ) -> bool:
     """
     Luồng Fallback Offline: Đọc tập dữ liệu mẫu `data/processed/sample_tracks.csv`
@@ -91,7 +91,7 @@ def stream_and_train_50pct(
     sample_ratio: float = 0.5,
     max_row_groups_per_file: Optional[int] = None,
     max_total_tracks: Optional[int] = None,
-    min_popularity: int = 0,
+    min_popularity: float = 0.0,
     clean_batches: bool = True,
     fallback_to_local: bool = True,
 ) -> bool:

@@ -1,0 +1,17 @@
+{
+    "model_name": "EmbeatRecommender",
+    "training_method": "csv",
+    "total_tracks": 29985,
+    "audio_features": 9,
+    "total_genres": 4211,
+    "audio_matrix_shape": [
+        29985,
+        9
+    ],
+    "genre_matrix_shape": [
+        29985,
+        4211
+    ],
+    "artifact_path": "embeat_recommender.joblib",
+    "artifact_filename": "embeat_recommender.joblib"
+}

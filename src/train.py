@@ -13,6 +13,35 @@ from scipy.sparse import csr_matrix
 from src.recommender import EmbeatRecommender
 
 
+DEFAULT_MAX_TRACKS = 300_000
+
+
+def select_compact_catalog(df, max_tracks=DEFAULT_MAX_TRACKS):
+    """Keep the most popular tracks for the deployable compact artifact."""
+    if max_tracks is None:
+        return df.copy()
+
+    if not isinstance(max_tracks, int) or max_tracks <= 0:
+        raise ValueError("max_tracks must be a positive integer.")
+
+    compact_df = df.copy()
+
+    if "popularity" in compact_df.columns:
+        compact_df["_popularity_sort"] = pd.to_numeric(
+            compact_df["popularity"], errors="coerce"
+        ).fillna(-1)
+        compact_df = compact_df.sort_values(
+            "_popularity_sort", ascending=False, kind="mergesort"
+        ).drop(columns="_popularity_sort")
+    else:
+        print(
+            "WARNING: popularity column is missing; "
+            "keeping the first tracks instead of ranking by popularity."
+        )
+
+    return compact_df.head(max_tracks).reset_index(drop=True)
+
+
 # ==========================================
 # 1. PROJECT CONFIGURATION
 # ==========================================
@@ -73,7 +102,7 @@ def build_genre_matrix(df):
 # 3. TRAINING PIPELINE
 # ==========================================
 
-def train_model(input_path, output_path):
+def train_model(input_path, output_path, max_tracks=DEFAULT_MAX_TRACKS):
 
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -94,6 +123,10 @@ def train_model(input_path, output_path):
 
     print("Original shape:", df.shape)
 
+    # Keep a compact, popularity-ranked catalog for deployment.
+    df = select_compact_catalog(df, max_tracks=max_tracks)
+    print("Compact catalog shape:", df.shape)
+
     # 2. Train audio model
     print("\n[2/5] Training audio model...")
 
@@ -107,27 +140,17 @@ def train_model(input_path, output_path):
         model.feature_matrix.shape
     )
 
-    # 3. Build genre matrix
-    print("\n[3/5] Building genre matrix...")
+    # 3. Validate genre matrix created by model.fit()
+    print("\n[3/5] Checking genre matrix...")
 
-    genre_matrix, mlb = build_genre_matrix(
-        model.df
-    )
+    if model.genre_matrix is None:
+        raise ValueError(
+            "Cannot train recommendation model: "
+            "artist_genres is missing or unavailable."
+        )
 
-    model.set_genre_matrix(
-        genre_matrix,
-        track_ids=model.df["track_id"].tolist()
-    )
-
-    print(
-        "Genre matrix:",
-        model.genre_matrix.shape
-    )
-
-    print(
-        "Unique genres:",
-        len(mlb.classes_)
-    )
+    print("Genre matrix:", model.genre_matrix.shape)
+    print("Unique genres:", model.genre_matrix.shape[1])
 
     # 4. Save model artifact
     print("\n[4/5] Saving model artifact...")
@@ -143,12 +166,13 @@ def train_model(input_path, output_path):
     metadata = {
         "model_name": "EmbeatRecommender",
         "training_method": "csv",
+        "compact_max_tracks": max_tracks,
         "total_tracks": len(model.df),
         "audio_features": model.feature_matrix.shape[1],
-        "total_genres": len(mlb.classes_),
+        "total_genres": model.genre_matrix.shape[1],
         "audio_matrix_shape": list(model.feature_matrix.shape),
         "genre_matrix_shape": list(model.genre_matrix.shape),
-        "artifact_path": str(output_path.resolve()),
+        "artifact_path": output_path.name,
         "artifact_filename": output_path.name,
     }
 
@@ -169,6 +193,8 @@ def train_model(input_path, output_path):
 
     print("Metadata saved:", metadata_path)
 
+    return model
+
 
 
 # ==========================================
@@ -181,8 +207,9 @@ def train_model_from_stream(
     sample_ratio=0.5,
     max_row_groups_per_file=None,
     max_total_tracks=None,
-    min_popularity=0,
+    min_popularity=0.0,
     fallback_to_local=True,
+    max_tracks=DEFAULT_MAX_TRACKS,
 ):
     """
     Train the recommendation model from streamed batches.
@@ -196,6 +223,13 @@ def train_model_from_stream(
     from src.stream_embeat import stream_and_train_50pct
 
     output_path = Path(output_path)
+
+    try:
+        min_popularity = float(min_popularity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_popularity must be between 0 and 1.") from exc
+    if not 0.0 <= min_popularity <= 1.0:
+        raise ValueError("min_popularity must be between 0 and 1.")
 
     print("=" * 55)
     print("EMBEAT STREAMING BATCH TRAINING")
@@ -223,44 +257,42 @@ def train_model_from_stream(
             "Model training was not finalized."
         )
 
-    if not model._pending_batches:
-        raise RuntimeError(
-            "Streaming completed without receiving any batches."
-        )
+    # 3. Finalize incremental training and apply compact selection once.
+    print("\n[2/5] Finalizing incremental training...")
 
-    # 3. Finalize audio model training
-    print("\n[2/5] Finalizing accumulated batches...")
+    model.finalize_incremental_training(max_tracks=max_tracks)
+    print("Compact catalog tracks:", len(model.df))
 
-    model.finalize_incremental_training()
+    # 4. Validate genre matrix created during finalization
+    print("\n[3/5] Checking genre matrix...")
 
-    # 4. Build genre matrix
-    print("\n[3/5] Building genre matrix...")
-
-    if "artist_genres" not in model.df.columns:
+    if model.genre_matrix is None:
         raise ValueError(
-            "Required column 'artist_genres' is missing."
+            "Genre matrix was not created during "
+            "finalize_incremental_training()."
         )
-
-    genre_matrix, mlb = build_genre_matrix(model.df)
-
-    model.set_genre_matrix(
-        genre_matrix,
-        track_ids=model.df["track_id"].tolist()
-    )
 
     print("Genre matrix:", model.genre_matrix.shape)
-    print("Unique genres:", len(mlb.classes_))
+    print("Unique genres:", model.genre_matrix.shape[1])
 
+    # 5. Save model artifact
+    print("\n[4/5] Saving model artifact...")
+
+    model.save_artifact(output_path)
+
+    # 6. Generate training metadata
+    print("\n[5/5] Generating training metadata...")
 
     metadata = {
         "model_name": "EmbeatRecommender",
         "training_method": "batch_accumulation",
+        "compact_max_tracks": max_tracks,
         "total_tracks": len(model.df),
         "audio_features": model.feature_matrix.shape[1],
-        "total_genres": len(mlb.classes_),
+        "total_genres": model.genre_matrix.shape[1],
         "audio_matrix_shape": list(model.feature_matrix.shape),
         "genre_matrix_shape": list(model.genre_matrix.shape),
-        "artifact_path": str(output_path.resolve()),
+        "artifact_path": output_path.name,
         "artifact_filename": output_path.name,
         "sample_ratio": sample_ratio,
         "max_total_tracks": max_total_tracks,
@@ -283,7 +315,7 @@ def train_model_from_stream(
 
     print("Metadata saved:", metadata_path)
 
-
+    return model
 
 
 # ==========================================
@@ -320,6 +352,13 @@ if __name__ == "__main__":
         help="Path to save model artifact"
     )
 
+    parser.add_argument(
+        "--max-tracks",
+        type=int,
+        default=DEFAULT_MAX_TRACKS,
+        help="Maximum tracks in the compact deployment artifact"
+    )
+
     # Cấu hình Streaming
     parser.add_argument(
         "--sample-ratio",
@@ -344,8 +383,8 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--min-popularity",
-        type=int,
-        default=0,
+        type=float,
+        default=0.0,
         help="Minimum popularity threshold"
     )
 
@@ -363,6 +402,12 @@ if __name__ == "__main__":
 
     if args.max_total_tracks is not None and args.max_total_tracks <= 0:
         parser.error("--max-total-tracks must be greater than 0")
+
+    if args.max_tracks <= 0:
+        parser.error("--max-tracks must be greater than 0")
+
+    if not 0.0 <= args.min_popularity <= 1.0:
+        parser.error("--min-popularity must be between 0 and 1")
 
     if (
         args.max_row_groups_per_file is not None
@@ -382,7 +427,8 @@ if __name__ == "__main__":
 
         train_model(
             input_path=args.input,
-            output_path=args.output
+            output_path=args.output,
+            max_tracks=args.max_tracks
         )
 
     elif args.mode == "stream":
@@ -395,7 +441,8 @@ if __name__ == "__main__":
             max_row_groups_per_file=args.max_row_groups_per_file,
             max_total_tracks=args.max_total_tracks,
             min_popularity=args.min_popularity,
-            fallback_to_local=not args.no_fallback
+            fallback_to_local=not args.no_fallback,
+            max_tracks=args.max_tracks
         )
 
     print("\nCLI TRAINING COMPLETED")
